@@ -13,7 +13,7 @@ const Product = require("../../models/Product");
 // search retrieval (search.service.js): it exists purely so
 // the admin can browse/search the already-synced catalog to
 // choose products for a goal. It does not rank, does not call
-// the AI/Qdrant stack, and does not write anything.
+// the AI/vector stack, and does not write anything.
 // =========================================================
 
 
@@ -35,10 +35,14 @@ const LIST_FIELDS =
   [
     "-_id",
     "sku",
+    "matchKey",
     "title",
     "handle",
     "image",
     "price",
+    "currency",
+    "availableForSale",
+    "inventoryQuantity",
     "shopifyProductId",
     "shopifyVariantId"
   ].join(" ");

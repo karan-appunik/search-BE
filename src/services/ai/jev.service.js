@@ -3,7 +3,7 @@
 // =========================================================
 //
 // Phase 1 (current): JEV is not a separate model or API call.
-// It reuses the semantic similarity scores Qdrant already
+// It reuses the semantic similarity scores vector search already
 // computed during retrieval (via the Qwen embedding model,
 // see search.service.js's findSemanticCandidates and
 // embedding.service.js) — no new network call, no new latency,
@@ -11,18 +11,26 @@
 // introduced later, this file is the one place that needs to
 // change; nothing else in the app should need to know.
 //
-// SHADOW MODE (current): this only ever LOGS what it would
-// select. It is never allowed to change what actually gets sent
-// to GLM — see search.service.js's call site, which always uses
-// the full, original candidate list regardless of what JEV says.
-// This exists purely so real query behavior can be compared
-// against what JEV would have done, before JEV is ever trusted
-// to filter anything for real.
+// ACTIVE (no longer shadow mode). JEV's scores are used in
+// search.service.js to:
+//   - rank the instant results shown while the customer types;
+//   - drop candidates below JEV_RELEVANCE_MIN_SCORE before the
+//     AI model sees them (resolveJevCandidatesForGlm);
+//   - answer the search when the AI model fails ("JEV MODEL
+//     RESPONSE": usage limit, token limit, invalid answer, error);
+//   - decide whether a Boost rule may promote a product
+//     (BOOST_RELEVANCE_MIN_SCORE);
+//   - pick the in-stock alternatives for "We didn't find
+//     exactly that...".
 //
-// Only ever narrows, never guarantees an empty result reaches
-// GLM: search.service.js's caller falls back to the full
-// candidate list whenever JEV selects nothing, so JEV can never
-// be the reason a customer sees "no products found".
+// Only ever narrows, never empties: search.service.js falls back
+// to the full candidate list whenever JEV selects nothing, so JEV
+// can never be the reason a customer sees "no products found".
+//
+// Logging: "[JEV]" summarises each selection, and "[JEV vs AI]"
+// compares what JEV would have shown with what the AI picked —
+// real-traffic evidence of how good JEV's instant and fallback
+// results are.
 // =========================================================
 
 const JEV_RELEVANCE_MIN_SCORE = Number(
@@ -81,53 +89,71 @@ function logJevShadowSelection({ query, candidates, jevSelection }) {
   const list = Array.isArray(candidates) ? candidates : [];
   const selectedKeys = new Set(jevSelection.selected.map(p => p.matchKey));
 
-  console.log("[JEV SHADOW] selection", {
-    query,
-    threshold: jevSelection.threshold,
-    totalCandidates: list.length,
-    jevSelectedCount: jevSelection.selected.length,
-    jevSelected: jevSelection.selected.map(p => ({
-      sku: p.matchKey,
-      title: p.title,
-      score: p._semanticScore
-    })),
-    notSelected: list
-      .filter(p => !selectedKeys.has(p.matchKey))
-      .map(p => ({
-        sku: p.matchKey,
-        title: p.title,
-        score: Number.isFinite(Number(p?._semanticScore)) ? p._semanticScore : null,
-        reason:
-          Number.isFinite(Number(p?._semanticScore))
-            ? "below threshold"
-            : "no semantic score (lexical-only match)"
-      }))
-  });
+  // One-line summary: counts plus the 5 highest-scoring selected
+  // (sorted on a copy; the real list is never reordered).
+  const notSelected = list.filter(p => !selectedKeys.has(p.matchKey));
+
+  const top = [...jevSelection.selected]
+    .sort((a, b) => Number(b?._semanticScore) - Number(a?._semanticScore))
+    .slice(0, 5)
+    .map(p => `${p.title} (${Number(p._semanticScore).toFixed(2)})`)
+    .join(", ");
+
+  console.log(
+    `[JEV] "${query}": ${jevSelection.selected.length}/${list.length} selected (threshold ${jevSelection.threshold})` +
+    `, ${notSelected.length} not selected` +
+    (top ? ` | top: ${top}` : "")
+  );
 }
 
 /*
- * Compares JEV's shadow selection against what GLM actually
- * recommended from the FULL (non-JEV-filtered) candidate list.
- * This is the number that answers "would turning JEV on for
- * real have helped or hurt" — specifically, whether GLM ever
- * picked something JEV would have already discarded.
+ * Compares what JEV would have shown for a search with what the AI
+ * actually picked, after a successful AI answer. One line per
+ * search; pure in-memory work (no I/O), so it never slows search.
+ *
+ *   jevRankedKeys            JEV's own ranking for the search
+ *                            (best first), as matchKeys
+ *   glmRecommendedMatchKeys  the AI's picks, as matchKeys
+ *   titles                   optional matchKey -> title map for
+ *                            readable logs
+ *
+ * JEV is compared over the same number of products the AI chose.
+ * Without jevRankedKeys it compares against JEV's selection.
  */
-function logJevVsGlmComparison({ jevSelection, glmRecommendedMatchKeys }) {
-  const jevKeys = new Set(jevSelection.selected.map(p => p.matchKey));
-  const glmKeys = new Set(
-    (glmRecommendedMatchKeys || []).map(key => String(key || "").trim()).filter(Boolean)
+function logJevVsGlmComparison({
+  query = "",
+  jevSelection,
+  jevRankedKeys,
+  glmRecommendedMatchKeys,
+  titles
+}) {
+  const aiKeys = [
+    ...new Set(
+      (glmRecommendedMatchKeys || []).map(key => String(key || "").trim()).filter(Boolean)
+    )
+  ];
+
+  if (!aiKeys.length) {
+    return;
+  }
+
+  const jevKeys = Array.isArray(jevRankedKeys)
+    ? jevRankedKeys.slice(0, aiKeys.length)
+    : (jevSelection?.selected || []).map(p => p.matchKey);
+
+  const jevSet = new Set(jevKeys);
+  const aiSet = new Set(aiKeys);
+
+  const same = aiKeys.filter(key => jevSet.has(key)).length;
+  const name = key => (titles && titles.get(key)) || key;
+  const aiOnly = aiKeys.filter(key => !jevSet.has(key)).map(name);
+  const jevOnly = jevKeys.filter(key => !aiSet.has(key)).map(name);
+
+  console.log(
+    `[JEV vs AI] "${query}": ${same}/${aiKeys.length} same (${Math.round((same / aiKeys.length) * 100)}%)` +
+    (aiOnly.length ? ` | AI only: ${aiOnly.join(", ")}` : "") +
+    (jevOnly.length ? ` | JEV only: ${jevOnly.join(", ")}` : "")
   );
-
-  const glmPickedThatJevWouldHaveMissed = [...glmKeys].filter(key => !jevKeys.has(key));
-  const jevPickedThatGlmIgnored = [...jevKeys].filter(key => !glmKeys.has(key));
-
-  console.log("[JEV SHADOW] vs GLM comparison", {
-    glmRecommendedCount: glmKeys.size,
-    jevSelectedCount: jevKeys.size,
-    agreementCount: [...glmKeys].filter(key => jevKeys.has(key)).length,
-    glmPickedThatJevWouldHaveMissed,
-    jevPickedThatGlmIgnored
-  });
 }
 
 module.exports = {

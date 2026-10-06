@@ -6,11 +6,12 @@ const express =
 const cors =
   require("cors");
 
+const {
+  corsOptions
+} = require("./config/cors-config");
+
 const connectDatabase =
   require("./config/database");
-
-const searchRoutes =
-  require("./routes/search.routes");
 
 const internalProductRoutes =
   require("./routes/internal-product.routes");
@@ -20,6 +21,15 @@ const aiSearchRoutes =
 
 const goalRoutes =
   require("./routes/goal.routes");
+
+const statusRoutes =
+  require("./routes/status.routes");
+
+const internalInventoryRoutes =
+  require("./routes/internal-inventory.routes");
+
+const privacyRoutes =
+  require("./routes/privacy.routes");
 
 const {
   ensureGoalIndexes
@@ -39,7 +49,7 @@ const PORT =
 // =========================================================
 
 app.use(
-  cors()
+  cors(corsOptions)
 );
 
 
@@ -63,6 +73,53 @@ app.use(
   }),
 
   goalRoutes
+);
+
+
+// =========================================================
+// INTERNAL STATUS API
+// =========================================================
+
+app.use(
+  "/api/internal/status",
+
+  express.json({
+    limit:
+      "1mb"
+  }),
+
+  statusRoutes
+);
+
+
+// =========================================================
+// INTERNAL INVENTORY + PRIVACY WEBHOOKS
+// =========================================================
+//
+// Authentication lives inside each routes file.
+// =========================================================
+
+app.use(
+  "/api/internal/inventory",
+
+  express.json({
+    limit:
+      "1mb"
+  }),
+
+  internalInventoryRoutes
+);
+
+
+app.use(
+  "/api/internal/privacy",
+
+  express.json({
+    limit:
+      "1mb"
+  }),
+
+  privacyRoutes
 );
 
 
@@ -122,18 +179,6 @@ app.get(
 // =========================================================
 // ROUTES
 // =========================================================
-
-app.use(
-  "/api/search",
-  searchRoutes
-);
-
-
-app.use(
-  "/api/internal",
-  internalProductRoutes
-);
-
 
 app.use(
   "/api/ai-search",

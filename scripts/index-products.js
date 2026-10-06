@@ -18,7 +18,7 @@ const {
 const {
   upsertProducts
 } =
-  require("../src/services/search/qdrant.service");
+  require("../src/services/search/vector.service");
 
 
 // =========================================================

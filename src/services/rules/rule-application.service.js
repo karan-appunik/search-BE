@@ -8,11 +8,11 @@
 // goal once (see goal.service.js's getActiveGoal) and passes
 // it in.
 //
-// This runs strictly AFTER retrieval (MongoDB lexical + Qdrant
+// This runs strictly AFTER retrieval (MongoDB lexical + vector
 // semantic), AFTER merging/deduplication, and AFTER GLM ranking
 // has already produced the caller's ranked/verified product
 // list. It never re-ranks by lexical/semantic score itself and
-// never talks to Qdrant, Mongo, or the LLM — it only reorders
+// never talks to vector search, Mongo, or the LLM — it only reorders
 // or filters the list GLM (or the existing fallback paths) has
 // already decided on.
 //

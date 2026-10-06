@@ -14,10 +14,16 @@ const mongoose = require("mongoose");
 const goalProductSchema =
   new mongoose.Schema(
     {
-      // PRIMARY PRODUCT MATCHING KEY
+      // PRIMARY PRODUCT MATCHING KEY (see Product.js)
+      matchKey: {
+        type: String,
+        default: ""
+      },
+
+      // Display only; "" for a product without a SKU.
       sku: {
         type: String,
-        required: true
+        default: ""
       },
 
       shopifyProductId: {
@@ -73,11 +79,9 @@ const goalSchema =
       },
 
       /*
-       * Selected product SKUs.
-       *
-       * SKU is the application's product identifier everywhere
-       * else (AI catalog, Qdrant payloads, result hydration), so
-       * the goal uses it too.
+       * Selected products' matchKeys (the real SKU, or
+       * "variant:<gid>" for a product without one). The field
+       * keeps its original name so the API shape is unchanged.
        */
       skus: {
         type: [String],
@@ -87,6 +91,17 @@ const goalSchema =
       products: {
         type: [goalProductSchema],
         default: []
+      },
+
+      /*
+       * What the rule does to the selected products in search.
+       * null until the seller picks one. Values must match
+       * rule-application.service.js's RULE_TYPES.
+       */
+      ruleType: {
+        type: String,
+        enum: ["boost", "exclude", "demote", null],
+        default: null
       },
 
       enabled: {

@@ -1,4 +1,5 @@
 const Product = require("../models/Product");
+const { invalidateShop } = require("../services/search/vector.service");
 
 // =========================================================
 // WEBHOOK: INVENTORY / AVAILABILITY UPDATE
@@ -9,9 +10,9 @@ const Product = require("../models/Product");
 // product ID — so this looks the variant up by
 // shopifyInventoryItemId (see Product.js) instead.
 //
-// No Qdrant write here: Qdrant's stored payload never included
+// No vector write here: the vector payload never included
 // availability/stock (only shop, sku, matchKey, ids, title — see
-// qdrant.service.js's upsertProducts), so availability has always
+// vector.service.js), so availability has always
 // been purely a MongoDB concern, checked at search/hydration time.
 //
 // Known simplification: `available > 0` is used as a stand-in for
@@ -50,6 +51,9 @@ const webhookUpdateInventory = async (req, res) => {
       }
     );
 
+    // In/out of stock changed: refresh the in-memory vector set.
+    invalidateShop(shop);
+
     console.log("[INVENTORY WEBHOOK] Update", {
       shop,
       shopifyInventoryItemId,
@@ -73,8 +77,7 @@ const webhookUpdateInventory = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Inventory webhook update failed",
-      error: error.message
+      message: "Inventory webhook update failed"
     });
   }
 };

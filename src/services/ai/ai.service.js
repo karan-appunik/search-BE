@@ -8,6 +8,11 @@ const OLLAMA_BASE_URL =
 const OLLAMA_API_KEY =
   process.env.OLLAMA_API_KEY || "";
 
+const GLM_NUM_PREDICT =
+  Number(process.env.OLLAMA_NUM_PREDICT) > 0
+    ? Number(process.env.OLLAMA_NUM_PREDICT)
+    : 1536;
+
 const OLLAMA_MODEL =
   process.env.OLLAMA_MODEL ||
   "glm-5.3-flash:cloud";
@@ -62,8 +67,11 @@ function normalizeText(
 // Cache is keyed by normalized query + supplied catalog SKUs.
 // =========================================================
 
-const GLM_CACHE_TTL_MS = 5 * 60 * 1000;
-const GLM_CACHE_MAX = 100;
+// Repeat searches (per shop + query + candidate set) reuse the
+// AI answer for an hour; more entries so an hour of distinct
+// searches isn't evicted early.
+const GLM_CACHE_TTL_MS = 60 * 60 * 1000;
+const GLM_CACHE_MAX = 500;
 
 const glmCache = new Map();
 const glmInFlight = new Map();
@@ -78,9 +86,13 @@ function getCatalogFingerprint(productCatalog) {
 
 }
 
-function getGLMCacheKey(query, productCatalog) {
+/*
+ * The shop is part of the key: two shops can share a query and
+ * even identical SKUs, and must never share a cached result.
+ */
+function getGLMCacheKey(shop, query, productCatalog) {
 
-  return `${normalizeText(query)}::${getCatalogFingerprint(productCatalog)}`;
+  return `${String(shop || "").trim().toLowerCase()}::${normalizeText(query)}::${getCatalogFingerprint(productCatalog)}`;
 
 }
 
@@ -547,8 +559,58 @@ function parseAIJson(
 // MAIN AI SEARCH
 // =========================================================
 
+/*
+ * Waits for a shared in-flight AI request. Each waiting search
+ * counts as one waiter; when a search is cancelled it stops
+ * waiting, and when no search is waiting any more the request
+ * to the AI provider itself is cancelled.
+ */
+function waitForSharedRequest(entry, signal) {
+  entry.waiters += 1;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const done = () => {
+      if (settled) return false;
+      settled = true;
+      entry.waiters -= 1;
+      if (signal) signal.removeEventListener("abort", onAbort);
+      return true;
+    };
+
+    const onAbort = () => {
+      if (!done()) return;
+
+      if (entry.waiters <= 0) {
+        entry.upstream.abort();
+      }
+
+      const error = new Error("AI request cancelled");
+      error.name = "AbortError";
+      reject(error);
+    };
+
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    entry.promise.then(
+      value => { if (done()) resolve(value); },
+      error => { if (done()) reject(error); }
+    );
+  });
+}
+
 const recommendProducts =
   async ({
+    shop,
+    signal = null,
     query,
     products,
     mode = "search"
@@ -622,6 +684,7 @@ const recommendProducts =
 
     const glmCacheKey =
       getGLMCacheKey(
+        shop,
         cleanQuery,
         productCatalog
       );
@@ -641,31 +704,27 @@ const recommendProducts =
     if (glmInFlight.has(glmCacheKey)) {
 
       console.log(
-        "[AI SERVICE] Reusing in-flight GLM request"
+        "[AI SERVICE] Reusing in-flight AI request"
       );
 
-      return glmInFlight.get(glmCacheKey);
+      return waitForSharedRequest(
+        glmInFlight.get(glmCacheKey),
+        signal
+      );
 
     }
+
+
+    // Cancels the call to the AI provider (timeout, or every
+    // waiting search was cancelled).
+    const upstream =
+      new AbortController();
 
 
     const runGLMRequest = async () => {
 
     console.log(
-      "[AI SERVICE] Provider:",
-      provider
-    );
-
-
-    console.log(
-      "[AI SERVICE] Model:",
-      OLLAMA_MODEL
-    );
-
-
-    console.log(
-      "[AI SERVICE] Product count:",
-      productCatalog.length
+      `[AI SERVICE] ${provider} / ${OLLAMA_MODEL}: ${productCatalog.length} products for "${cleanQuery}"`
     );
 
 
@@ -740,10 +799,6 @@ No match:
     }
 
 
-    console.log(
-      "[AI SERVICE] Ollama URL:",
-      ollamaUrl
-    );
 
 
     const startedAt =
@@ -751,7 +806,7 @@ No match:
 
 
     const controller =
-      new AbortController();
+      upstream;
 
 
     const timeout =
@@ -860,9 +915,17 @@ No match:
                    * Preview output is intentionally compact:
                    * SKU + score only. This reduces latency and
                    * prevents JSON truncation on Ollama Cloud.
+                   *
+                   * Customer searches need more room: glm-5.3-flash
+                   * writes hidden reasoning before its JSON (it
+                   * ignores think:false), and at 512 tokens it was
+                   * usually cut off, so JEV answered instead.
+                   * Configurable via OLLAMA_NUM_PREDICT.
                    */
                   num_predict:
-                    mode === "preview" ? 160 : 512
+                    mode === "preview"
+                      ? 160
+                      : GLM_NUM_PREDICT
 
                 }
 
@@ -947,6 +1010,31 @@ console.log(
       return {
         intent: "no_match",
         resultType: "invalid",
+        failure: "empty_output",
+        recommendations: []
+      };
+
+    }
+
+
+    /*
+     * The model ran out of tokens (num_predict) before finishing,
+     * so whatever JSON it produced is cut off. Treat it as a
+     * failed answer (search then uses JEV) rather than guessing
+     * products out of partial text.
+     */
+    if (
+      data?.done_reason === "length"
+    ) {
+
+      console.warn(
+        "[AI SERVICE] GLM ran out of tokens before answering"
+      );
+
+      return {
+        intent: "no_match",
+        resultType: "invalid",
+        failure: "token_limit",
         recommendations: []
       };
 
@@ -974,6 +1062,7 @@ console.log(
       return {
         intent: "no_match",
         resultType: "invalid",
+        failure: "invalid_json",
         recommendations: []
       };
 
@@ -1121,15 +1210,20 @@ console.log(
 
 
     console.log(
-      "[AI SERVICE] Final result:",
-      finalResult
+      `[AI SERVICE] Result: ${finalResult.resultType}, ${finalResult.recommendations.length} recommendations`
     );
 
 
-    setCachedGLMResult(
-      glmCacheKey,
-      finalResult
-    );
+    // A failed answer is never cached: the next search for the
+    // same query should try GLM again, not repeat the failure.
+    if (
+      finalResult.resultType !== "invalid"
+    ) {
+      setCachedGLMResult(
+        glmCacheKey,
+        finalResult
+      );
+    }
 
 
     return finalResult;
@@ -1140,26 +1234,38 @@ console.log(
     const requestPromise =
       runGLMRequest();
 
+    const entry = {
+      promise: requestPromise,
+      upstream,
+      waiters: 0
+    };
+
     glmInFlight.set(
       glmCacheKey,
-      requestPromise
+      entry
     );
 
+    // A request every waiter abandoned still settles; never leave
+    // its rejection unhandled.
+    requestPromise.catch(() => {});
 
     try {
-      return await requestPromise;
+      return await waitForSharedRequest(entry, signal);
     } finally {
-      if (
-        glmInFlight.get(glmCacheKey) ===
-        requestPromise
-      ) {
-        glmInFlight.delete(glmCacheKey);
-      }
+      requestPromise.finally(() => {
+        if (
+          glmInFlight.get(glmCacheKey) ===
+          entry
+        ) {
+          glmInFlight.delete(glmCacheKey);
+        }
+      }).catch(() => {});
     }
 
   };
 
 
 module.exports = {
-  recommendProducts
+  recommendProducts,
+  getGLMCacheKey
 };

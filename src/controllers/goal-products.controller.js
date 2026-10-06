@@ -18,7 +18,7 @@ const {
 //
 // Read-only. Used by the admin Goal UI's product picker to
 // browse/search the already-synced catalog. Does not touch
-// search retrieval, Qdrant, or the AI/GLM pipeline.
+// search retrieval, vector search, or the AI/GLM pipeline.
 // =========================================================
 
 const listProducts = async (

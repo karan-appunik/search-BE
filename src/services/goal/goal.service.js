@@ -121,28 +121,35 @@ const normalizeProducts = (
     of values || []
   ) {
 
-    const sku =
+    const matchKey =
       String(
-        value?.sku || ""
+        value?.matchKey ||
+        value?.sku ||
+        ""
       ).trim();
 
 
     if (
-      !sku ||
-      !allowed.has(sku) ||
-      seen.has(sku)
+      !matchKey ||
+      !allowed.has(matchKey) ||
+      seen.has(matchKey)
     ) {
 
       continue;
     }
 
 
-    seen.add(sku);
+    seen.add(matchKey);
 
 
     products.push({
 
-      sku,
+      matchKey,
+
+      sku:
+        String(
+          value?.sku || ""
+        ).trim(),
 
       shopifyProductId:
         String(
@@ -201,13 +208,13 @@ const findUnknownSkus = async ({
 
       shop,
 
-      sku: {
+      matchKey: {
         $in: skus
       }
 
     })
 
-      .select("sku")
+      .select("matchKey")
 
       .lean();
 
@@ -215,7 +222,7 @@ const findUnknownSkus = async ({
   const ownedSkus =
     new Set(
       owned.map(
-        product => product.sku
+        product => product.matchKey
       )
     );
 
@@ -233,11 +240,38 @@ const findUnknownSkus = async ({
 
 const getGoal = async (
   shop
-) =>
-  Goal.findOne({
-    shop:
-      normalizeShop(shop)
-  }).lean();
+) => {
+
+  const goal =
+    await Goal.findOne({
+      shop:
+        normalizeShop(shop)
+    }).lean();
+
+
+  /*
+   * Goals saved before matchKey existed only stored sku, which
+   * was the matchKey back then.
+   */
+  if (
+    goal &&
+    Array.isArray(goal.products)
+  ) {
+
+    goal.products =
+      goal.products.map(
+        product => ({
+          ...product,
+          matchKey:
+            product.matchKey ||
+            product.sku
+        })
+      );
+  }
+
+
+  return goal;
+};
 
 
 /*
@@ -286,7 +320,8 @@ const upsertGoal = async ({
   name,
   skus,
   products,
-  enabled
+  enabled,
+  ruleType
 }) => {
 
   const update = {
@@ -313,6 +348,16 @@ const upsertGoal = async ({
 
     update.enabled =
       Boolean(enabled);
+  }
+
+
+  // Same rule for ruleType: undefined = keep the current one.
+  if (
+    ruleType !== undefined
+  ) {
+
+    update.ruleType =
+      ruleType;
   }
 
 

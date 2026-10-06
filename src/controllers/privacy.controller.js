@@ -1,5 +1,5 @@
 const Product = require("../models/Product");
-const { deleteProductPoints } = require("../services/search/qdrant.service");
+const { deleteProductPoints } = require("../services/search/vector.service");
 const { deleteGoal } = require("../services/goal/goal.service");
 
 // =========================================================
@@ -10,11 +10,11 @@ const { deleteGoal } = require("../services/goal/goal.service");
 // app, and requires the app to delete everything it holds for
 // that shop. Today, nothing does this: webhooks.app.uninstalled.jsx
 // only clears the login session — the shop's product catalog and
-// goal/rule end up orphaned in MongoDB and Qdrant forever. This is
+// goal/rule end up orphaned in MongoDB forever. This is
 // the actual data-deletion step, using only functions the rest of
 // the app already relies on (deleteProductPoints, deleteGoal) —
 // no new deletion logic, just wiring the same cleanup already
-// proven correct elsewhere (see the earlier Qdrant orphan-data
+// proven correct elsewhere (see the earlier orphan-data
 // fix) into this mandatory compliance path.
 //
 // Idempotent and safe to run more than once (e.g. a redelivered
@@ -41,10 +41,10 @@ const redactShop = async (req, res) => {
     if (matchKeys.length) {
       try {
         await deleteProductPoints(shop, matchKeys);
-      } catch (qdrantError) {
+      } catch (vectorError) {
         console.warn(
-          "[SHOP REDACT] Could not remove Qdrant points (non-fatal, MongoDB already redacted):",
-          qdrantError.message
+          "[SHOP REDACT] Could not refresh vector cache (non-fatal, MongoDB already redacted):",
+          vectorError.message
         );
       }
     }
@@ -69,8 +69,7 @@ const redactShop = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Shop redact failed",
-      error: error.message
+      message: "Shop redact failed"
     });
   }
 };

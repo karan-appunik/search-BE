@@ -8,6 +8,10 @@ const {
   deleteGoal
 } = require("../services/goal/goal.service");
 
+const {
+  RULE_TYPES
+} = require("../services/rules/rule-application.service");
+
 
 const NAME_MAX_LENGTH = 120;
 
@@ -101,7 +105,8 @@ const saveGoal = async (
       name: rawName,
       skus: rawSkus,
       products: rawProducts,
-      enabled
+      enabled,
+      ruleType: rawRuleType
     } = req.body || {};
 
 
@@ -212,6 +217,45 @@ const saveGoal = async (
 
 
     /*
+     * undefined leaves the stored rule type unchanged; null or
+     * "" clears it.
+     */
+    let ruleType;
+
+    if (
+      rawRuleType === null ||
+      rawRuleType === ""
+    ) {
+
+      ruleType = null;
+
+    } else if (
+      rawRuleType !== undefined
+    ) {
+
+      ruleType =
+        String(rawRuleType)
+          .trim()
+          .toLowerCase();
+
+
+      if (
+        !RULE_TYPES.includes(ruleType)
+      ) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            `Rule type must be one of: ${RULE_TYPES.join(", ")}`
+
+        });
+      }
+    }
+
+
+    /*
      * Duplicates are removed rather than rejected. The merchant
      * selecting the same product twice is not an error, and the
      * stored ordering stays the one they chose.
@@ -288,7 +332,8 @@ const saveGoal = async (
         name,
         skus,
         products,
-        enabled
+        enabled,
+        ruleType
       });
 
 
@@ -298,6 +343,9 @@ const saveGoal = async (
         shop,
 
         name,
+
+        ruleType:
+          goal?.ruleType || null,
 
         skus:
           skus.length,

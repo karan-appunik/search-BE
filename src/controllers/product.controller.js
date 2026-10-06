@@ -38,11 +38,7 @@ const syncShopifyProducts = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Product sync failed",
-
-      // Temporary debugging information.
-      // We will remove this later.
-      error: error.message
+      message: "Product sync failed"
     });
   }
 };

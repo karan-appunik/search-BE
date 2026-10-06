@@ -4,6 +4,7 @@ require("dotenv").config();
 
 const mongoose = require("mongoose");
 const Product = require("../src/models/Product");
+const Goal = require("../src/models/Goal");
 const { upsertGoal, getGoal } = require("../src/services/goal/goal.service");
 const { redactShop } = require("../src/controllers/privacy.controller");
 
@@ -57,6 +58,7 @@ before(async () => {
 
 after(async () => {
   await Product.deleteMany({ shop: { $in: [TEST_SHOP, OTHER_SHOP] } });
+  await Goal.deleteMany({ shop: { $in: [TEST_SHOP, OTHER_SHOP] } });
   await mongoose.disconnect();
 });
 

@@ -2,7 +2,7 @@ const mongoose = require("mongoose");
 
 const productRepository = require("../../repositories/product.repository");
 const goalRepository = require("../../repositories/goal.repository");
-const { getCollectionStatus } = require("../search/qdrant.service");
+const { getVectorIndexStatus } = require("../search/vector.service");
 
 // =========================================================
 // STATUS SERVICE
@@ -113,11 +113,11 @@ async function getShopStatus(shop) {
 // =========================================================
 
 async function getGlobalStatus() {
-  const [productsAllShops, goalCount, shops, qdrant, embeddingOllama, glmOllama] = await Promise.all([
+  const [productsAllShops, goalCount, shops, vectorSearch, embeddingOllama, glmOllama] = await Promise.all([
     productRepository.countAllShops(),
     goalRepository.countAll(),
     productRepository.distinctShopsWithCounts(),
-    getCollectionStatus(),
+    getVectorIndexStatus(),
     checkOllamaReachable(process.env.OLLAMA_LOCAL_URL, null),
     checkOllamaReachable(process.env.OLLAMA_BASE_URL, process.env.OLLAMA_API_KEY)
   ]);
@@ -127,10 +127,7 @@ async function getGlobalStatus() {
     products: productsAllShops,
     goals: { total: goalCount },
     shops,
-    qdrant: {
-      collection: process.env.QDRANT_COLLECTION || "shopify_product_search",
-      ...qdrant
-    },
+    vectorSearch,
     embeddingService: {
       model: process.env.OLLAMA_EMBEDDING_MODEL || null,
       ...embeddingOllama

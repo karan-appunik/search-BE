@@ -293,12 +293,12 @@ test("CORS middleware: a disallowed origin gets no CORS header and NEVER a 500/s
 });
 
 // ---------------------------------------------------------
-// 5 — Qdrant fails loudly on a missing shop instead of
+// 5 — vector search fails loudly on a missing shop instead of
 // silently searching across every tenant
 // ---------------------------------------------------------
 
 test("searchByVector throws when shop is missing", async () => {
-  const { searchByVector } = require("../src/services/search/qdrant.service");
+  const { searchByVector } = require("../src/services/search/vector.service");
 
   await assert.rejects(
     () => searchByVector([0.1, 0.2, 0.3], { limit: 5 }),
@@ -307,7 +307,7 @@ test("searchByVector throws when shop is missing", async () => {
 });
 
 test("searchByVector throws when shop is an empty string", async () => {
-  const { searchByVector } = require("../src/services/search/qdrant.service");
+  const { searchByVector } = require("../src/services/search/vector.service");
 
   await assert.rejects(
     () => searchByVector([0.1, 0.2, 0.3], { shop: "", limit: 5 }),
@@ -316,7 +316,7 @@ test("searchByVector throws when shop is an empty string", async () => {
 });
 
 test("searchByVector returns [] for an empty embedding without needing a shop (nothing to search)", async () => {
-  const { searchByVector } = require("../src/services/search/qdrant.service");
+  const { searchByVector } = require("../src/services/search/vector.service");
 
   // No network call happens for an empty/invalid embedding — this
   // stays safe to run without live Qdrant, same precedent as
