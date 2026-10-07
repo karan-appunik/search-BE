@@ -2686,12 +2686,20 @@
         }
 
         const {
-          candidatesForGlm,
+          candidatesForGlm: rawCandidatesForGlm,
           jevSelection
         } = resolveJevCandidatesForGlm({
           candidates: retrieved,
           forcedBoostCandidates
         });
+
+        const candidatesForGlm = (() => {
+          if (!isApplicableGoal(activeGoal) || activeGoal.ruleType !== "exclude") {
+            return rawCandidatesForGlm;
+          }
+          const excludedSet = new Set(activeGoal.skus);
+          return rawCandidatesForGlm.filter(p => !excludedSet.has(productKey(p)));
+        })();
 
         logJevShadowSelection({
           query: cleanQuery,
