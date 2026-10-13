@@ -2,7 +2,7 @@ const mongoose = require("mongoose");
 
 const productRepository = require("../../repositories/product.repository");
 const goalRepository = require("../../repositories/goal.repository");
-const { getVectorIndexStatus } = require("../search/vector.service");
+const { getJevIndexStatus } = require("../search/jev-index.service");
 
 // =========================================================
 // STATUS SERVICE
@@ -37,11 +37,10 @@ function getMongoStatus() {
 }
 
 /*
- * Best-effort reachability check for an Ollama endpoint
- * (local Qwen embeddings, or the cloud GLM chat API). Uses
- * GET /api/tags — the standard read-only Ollama endpoint for
- * listing available models — rather than triggering a real
- * embedding or chat generation call.
+ * Best-effort reachability check for the Ollama cloud chat API
+ * (the AI ranking model). Uses GET /api/tags — the standard
+ * read-only Ollama endpoint for listing available models —
+ * rather than triggering a real chat generation call.
  *
  * A short timeout keeps this from blocking the whole status
  * response if an endpoint is slow/unreachable. On any failure
@@ -113,12 +112,10 @@ async function getShopStatus(shop) {
 // =========================================================
 
 async function getGlobalStatus() {
-  const [productsAllShops, goalCount, shops, vectorSearch, embeddingOllama, glmOllama] = await Promise.all([
+  const [productsAllShops, goalCount, shops, glmOllama] = await Promise.all([
     productRepository.countAllShops(),
     goalRepository.countAll(),
     productRepository.distinctShopsWithCounts(),
-    getVectorIndexStatus(),
-    checkOllamaReachable(process.env.OLLAMA_LOCAL_URL, null),
     checkOllamaReachable(process.env.OLLAMA_BASE_URL, process.env.OLLAMA_API_KEY)
   ]);
 
@@ -127,11 +124,7 @@ async function getGlobalStatus() {
     products: productsAllShops,
     goals: { total: goalCount },
     shops,
-    vectorSearch,
-    embeddingService: {
-      model: process.env.OLLAMA_EMBEDDING_MODEL || null,
-      ...embeddingOllama
-    },
+    jev: getJevIndexStatus(),
     llmService: {
       model: process.env.OLLAMA_MODEL || null,
       ...glmOllama

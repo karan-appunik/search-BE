@@ -168,46 +168,6 @@ const productSchema =
       inventoryQuantity: {
         type: Number,
         default: 0
-      },
-
-          // =====================================================
-    // SEMANTIC SEARCH METADATA
-    // =====================================================
-
-    embeddingText: {
-        type: String,
-        default: ""
-      },
-
-      embeddingHash: {
-        type: String,
-        default: ""
-      },
-
-      embeddingModel: {
-        type: String,
-        default: ""
-      },
-
-      embeddingIndexedAt: {
-        type: Date,
-        default: null
-      },
-
-      /*
-       * The product's semantic vector (qwen3-embedding), used by
-       * vector.service.js for JEV similarity scores. Large, so it
-       * is never loaded unless a query asks for "+embedding".
-       */
-      embedding: {
-        type: [Number],
-        default: undefined,
-        select: false
-      },
-
-      hasEmbedding: {
-        type: Boolean,
-        default: false
       }
     },
 
@@ -215,13 +175,6 @@ const productSchema =
       timestamps: true
     }
   );
-
-
-// Loads one shop's vectors for vector.service.js.
-productSchema.index({
-  shop: 1,
-  hasEmbedding: 1
-});
 
 
 // =========================================================

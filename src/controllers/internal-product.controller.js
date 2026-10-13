@@ -1,17 +1,10 @@
 const Product = require("../models/Product");
 
+// Any product write drops the shop's cached JEV catalog, so the
+// next search scores the current products.
 const {
-  buildEmbeddingText,
-  getEmbeddingHash,
-  createEmbeddings,
-  OLLAMA_EMBEDDING_MODEL
-} = require("../services/ai/embedding.service");
-
-const {
-  upsertProducts,
-  deleteProductPoints,
   invalidateShop
-} = require("../services/search/vector.service");
+} = require("../services/search/jev-index.service");
 
 
 /*
@@ -25,8 +18,7 @@ const {
  * The Shopify variant ID is the identity (it never changes);
  * sku is optional and matchKey falls back to the variant ID.
  * Resolves to the matchKey the document had BEFORE this write
- * (null for a new document), so callers can drop a stale vector
- * point whose key just changed.
+ * (null for a new document).
  */
 
 const upsertVariant = async (
@@ -148,212 +140,6 @@ const upsertVariant = async (
 
 
   return previous?.matchKey || null;
-};
-
-
-/*
- * ---------------------------------------------------------
- * BEST-EFFORT VECTOR REFRESH
- * ---------------------------------------------------------
- *
- * Re-embeds only variants whose embedding text actually
- * changed (price/stock edits leave it untouched), and removes
- * cached vectors for variants that were deleted. Runs after
- * the webhook response is sent, so a slow or offline Ollama
- * never makes Shopify retry the webhook. Anything missed here
- * is picked up by `npm run index:products`.
- */
-
-/*
- * Shopify often sends create + update for the same product
- * seconds apart. Refreshes for one product are chained so a
- * slow earlier embedding can't re-insert a point that a later
- * webhook already deleted.
- */
-const refreshQueues = new Map();
-
-const EMBEDDING_BATCH_SIZE = 4;
-
-const refreshVectors = (
-  shop,
-  shopifyProductId,
-  loadProducts,
-  removedMatchKeys
-) => {
-
-  const key =
-    `${shop}:${shopifyProductId}`;
-
-  const previous =
-    refreshQueues.get(key) ||
-    Promise.resolve();
-
-  const next =
-    previous.then(
-      () =>
-        runVectorRefresh(
-          shop,
-          loadProducts,
-          removedMatchKeys
-        )
-    );
-
-  refreshQueues.set(
-    key,
-    next
-  );
-
-  next.finally(() => {
-    if (
-      refreshQueues.get(key) ===
-      next
-    ) {
-      refreshQueues.delete(key);
-    }
-  });
-
-  return next;
-};
-
-const runVectorRefresh = async (
-  shop,
-  loadProducts,
-  removedMatchKeys
-) => {
-
-  try {
-
-    const products =
-      await loadProducts();
-
-
-    await deleteProductPoints(
-      shop,
-      removedMatchKeys
-    );
-
-
-    const texts =
-      products.map(
-        buildEmbeddingText
-      );
-
-    const changed =
-      products
-        .map(
-          (product, index) => ({
-            product,
-            text:
-              texts[index],
-            hash:
-              getEmbeddingHash(
-                texts[index]
-              )
-          })
-        )
-        .filter(
-          item =>
-            item.hash !==
-            item.product.embeddingHash ||
-            // e.g. vectors that only ever lived in Qdrant
-            item.product.hasEmbedding !== true
-        );
-
-
-    if (
-      !changed.length
-    ) {
-
-      return;
-    }
-
-
-    /*
-     * Same batch size as scripts/index-products.js, so a full
-     * sync of a large catalog never sends one huge embedding
-     * request.
-     */
-    for (
-      let offset = 0;
-      offset < changed.length;
-      offset += EMBEDDING_BATCH_SIZE
-    ) {
-
-      const batch =
-        changed.slice(
-          offset,
-          offset + EMBEDDING_BATCH_SIZE
-        );
-
-
-      const embeddings =
-        await createEmbeddings(
-          batch.map(
-            item =>
-              item.text
-          )
-        );
-
-
-      await upsertProducts(
-        batch.map(
-          item =>
-            item.product
-        ),
-        embeddings
-      );
-
-
-      await Product.bulkWrite(
-        batch.map(
-          item => ({
-            updateOne: {
-              filter: {
-                _id:
-                  item.product._id
-              },
-              update: {
-                $set: {
-                  embeddingText:
-                    item.text,
-                  embeddingHash:
-                    item.hash,
-                  embeddingModel:
-                    OLLAMA_EMBEDDING_MODEL,
-                  embeddingIndexedAt:
-                    new Date()
-                }
-              }
-            }
-          })
-        ),
-        {
-          ordered:
-            false
-        }
-      );
-
-    }
-
-
-    console.log(
-      "[PRODUCT WEBHOOK] Vectors refreshed",
-      {
-        shop,
-        reembedded:
-          changed.length,
-        removed:
-          removedMatchKeys.length
-      }
-    );
-
-  } catch (error) {
-
-    console.error(
-      "[PRODUCT WEBHOOK] Vector refresh failed (run `npm run index:products` to catch up):",
-      error.message
-    );
-  }
 };
 
 
@@ -511,17 +297,6 @@ const syncProducts = async (req, res) => {
     };
 
 
-    const staleMatchKeys =
-      (
-        await Product.find(staleFilter)
-          .select("matchKey")
-          .lean()
-      ).map(
-        product =>
-          product.matchKey
-      );
-
-
     const deleteResult =
       await Product.deleteMany(
         staleFilter
@@ -531,7 +306,6 @@ const syncProducts = async (req, res) => {
     const deleted =
       deleteResult.deletedCount || 0;
 
-    // Stock may have changed: refresh the in-memory vector set.
     invalidateShop(shop);
 
 
@@ -561,7 +335,7 @@ const syncProducts = async (req, res) => {
     );
 
 
-    res.status(200).json({
+    return res.status(200).json({
 
       success: true,
 
@@ -587,12 +361,6 @@ const syncProducts = async (req, res) => {
       }
 
     });
-
-
-    return {
-      shop,
-      staleMatchKeys
-    };
 
 
   } catch (error) {
@@ -649,8 +417,6 @@ const webhookUpsertProduct = async (req, res) => {
     let skipped = 0;
 
 
-    const changedMatchKeys = [];
-
     for (const variant of variants) {
 
       if (!variant?.id) {
@@ -660,26 +426,12 @@ const webhookUpsertProduct = async (req, res) => {
 
       currentVariantIds.push(variant.id);
 
-      const previousMatchKey =
-        await upsertVariant(
-          shop,
-          currency,
-          product,
-          variant
-        );
-
-      const matchKey =
-        Product.buildMatchKey(
-          variant.sku,
-          variant.id
-        );
-
-      if (
-        previousMatchKey &&
-        previousMatchKey !== matchKey
-      ) {
-        changedMatchKeys.push(previousMatchKey);
-      }
+      await upsertVariant(
+        shop,
+        currency,
+        product,
+        variant
+      );
 
       synced++;
     }
@@ -691,11 +443,6 @@ const webhookUpsertProduct = async (req, res) => {
       shopifyVariantId: { $nin: currentVariantIds }
     };
 
-    const stale =
-      await Product.find(staleFilter)
-        .select("matchKey")
-        .lean();
-
     const deleteResult =
       await Product.deleteMany(staleFilter);
 
@@ -703,7 +450,6 @@ const webhookUpsertProduct = async (req, res) => {
       deleteResult.deletedCount || 0;
 
 
-    // Stock may have changed: refresh the in-memory vector set.
     invalidateShop(shop);
 
     console.log("[PRODUCT WEBHOOK] Upsert", {
@@ -715,26 +461,11 @@ const webhookUpsertProduct = async (req, res) => {
     });
 
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: "Product webhook processed",
       data: { synced, skipped, deleted }
     });
-
-
-    refreshVectors(
-      shop,
-      product.id,
-      () =>
-        Product.find({
-          shop,
-          shopifyProductId: product.id
-        }).lean(),
-      [
-        ...stale.map(item => item.matchKey),
-        ...changedMatchKeys
-      ]
-    );
 
   } catch (error) {
 
@@ -770,16 +501,13 @@ const webhookDeleteProduct = async (req, res) => {
 
     const filter = { shop, shopifyProductId };
 
-    const removed =
-      await Product.find(filter)
-        .select("matchKey")
-        .lean();
-
     const deleteResult =
       await Product.deleteMany(filter);
 
     const variantsRemoved =
       deleteResult.deletedCount || 0;
+
+    invalidateShop(shop);
 
 
     console.log("[PRODUCT WEBHOOK] Delete", {
@@ -789,19 +517,11 @@ const webhookDeleteProduct = async (req, res) => {
     });
 
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: "Product delete webhook processed",
       data: { variantsRemoved }
     });
-
-
-    refreshVectors(
-      shop,
-      shopifyProductId,
-      async () => [],
-      removed.map(item => item.matchKey)
-    );
 
   } catch (error) {
 
@@ -817,38 +537,8 @@ const webhookDeleteProduct = async (req, res) => {
 };
 
 
-/*
- * Route handler for the full sync: runs the Mongo sync, then
- * brings vectors up to date in the background (new or changed
- * products embedded, deleted ones removed). Kept separate from
- * syncProducts so the Mongo-only tests never compute embeddings.
- */
-const syncProductsAndRefreshVectors = async (req, res) => {
-
-  const result =
-    await syncProducts(req, res);
-
-
-  if (!result) {
-    return;
-  }
-
-
-  refreshVectors(
-    result.shop,
-    "*full-sync*",
-    () =>
-      Product.find({
-        shop: result.shop
-      }).lean(),
-    result.staleMatchKeys
-  );
-};
-
-
 module.exports = {
   syncProducts,
-  syncProductsAndRefreshVectors,
   webhookUpsertProduct,
   webhookDeleteProduct
 };

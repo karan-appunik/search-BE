@@ -1,5 +1,5 @@
 const Product = require("../models/Product");
-const { deleteProductPoints } = require("../services/search/vector.service");
+const { invalidateShop } = require("../services/search/jev-index.service");
 const { deleteGoal } = require("../services/goal/goal.service");
 
 // =========================================================
@@ -12,7 +12,7 @@ const { deleteGoal } = require("../services/goal/goal.service");
 // only clears the login session — the shop's product catalog and
 // goal/rule end up orphaned in MongoDB forever. This is
 // the actual data-deletion step, using only functions the rest of
-// the app already relies on (deleteProductPoints, deleteGoal) —
+// the app already relies on (invalidateShop, deleteGoal) —
 // no new deletion logic, just wiring the same cleanup already
 // proven correct elsewhere (see the earlier orphan-data
 // fix) into this mandatory compliance path.
@@ -32,22 +32,10 @@ const redactShop = async (req, res) => {
       });
     }
 
-    const matchKeys = (
-      await Product.find({ shop }).select("matchKey").lean()
-    ).map(product => product.matchKey);
-
     const deleteResult = await Product.deleteMany({ shop });
 
-    if (matchKeys.length) {
-      try {
-        await deleteProductPoints(shop, matchKeys);
-      } catch (vectorError) {
-        console.warn(
-          "[SHOP REDACT] Could not refresh vector cache (non-fatal, MongoDB already redacted):",
-          vectorError.message
-        );
-      }
-    }
+    // drop the shop's cached catalog from memory too
+    invalidateShop(shop);
 
     const goalDeleted = await deleteGoal(shop);
 

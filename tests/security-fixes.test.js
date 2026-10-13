@@ -21,9 +21,8 @@ const mongoose = require("mongoose");
 //      data (every shop's domain + product count) to ANY
 //      caller, including a regular merchant's own request.
 //   4. cors() ran with no origin restriction at all.
-//   5. Qdrant's searchByVector only attached its shop filter
-//      `if (shop)` — a missing shop would silently search
-//      across every tenant instead of failing.
+//   5. Relevance search must never run without a shop — a
+//      missing shop must fail, not search every tenant.
 //
 // Route-wiring checks below inspect the actual Express Router's
 // .stack (no live HTTP server needed) to confirm the middleware
@@ -293,34 +292,30 @@ test("CORS middleware: a disallowed origin gets no CORS header and NEVER a 500/s
 });
 
 // ---------------------------------------------------------
-// 5 — vector search fails loudly on a missing shop instead of
-// silently searching across every tenant
+// 5 — JEV relevance scoring fails loudly on a missing shop
+// instead of silently scoring across every tenant
 // ---------------------------------------------------------
 
-test("searchByVector throws when shop is missing", async () => {
-  const { searchByVector } = require("../src/services/search/vector.service");
+test("JEV scoring throws when shop is missing", async () => {
+  const { scoreShopProducts } = require("../src/services/search/jev-index.service");
 
   await assert.rejects(
-    () => searchByVector([0.1, 0.2, 0.3], { limit: 5 }),
+    () => scoreShopProducts({ queryWords: ["jacket"] }),
     /shop is required/i
   );
 });
 
-test("searchByVector throws when shop is an empty string", async () => {
-  const { searchByVector } = require("../src/services/search/vector.service");
+test("JEV scoring throws when shop is an empty string", async () => {
+  const { scoreShopProducts } = require("../src/services/search/jev-index.service");
 
   await assert.rejects(
-    () => searchByVector([0.1, 0.2, 0.3], { shop: "", limit: 5 }),
+    () => scoreShopProducts({ shop: "", queryWords: ["jacket"] }),
     /shop is required/i
   );
 });
 
-test("searchByVector returns [] for an empty embedding without needing a shop (nothing to search)", async () => {
-  const { searchByVector } = require("../src/services/search/vector.service");
+test("JEV scoring of an empty query returns [] (nothing to search)", () => {
+  const { buildIndex, scoreIndex } = require("../src/services/search/jev-index.service");
 
-  // No network call happens for an empty/invalid embedding — this
-  // stays safe to run without live Qdrant, same precedent as
-  // qdrant.delete-points.test.js.
-  const result = await searchByVector([], { shop: "" });
-  assert.deepEqual(result, []);
+  assert.deepEqual(scoreIndex(buildIndex([{ title: "Denim Jacket" }]), []), []);
 });

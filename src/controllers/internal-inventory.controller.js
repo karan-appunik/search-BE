@@ -1,5 +1,5 @@
 const Product = require("../models/Product");
-const { invalidateShop } = require("../services/search/vector.service");
+const { invalidateShop } = require("../services/search/jev-index.service");
 
 // =========================================================
 // WEBHOOK: INVENTORY / AVAILABILITY UPDATE
@@ -10,10 +10,9 @@ const { invalidateShop } = require("../services/search/vector.service");
 // product ID — so this looks the variant up by
 // shopifyInventoryItemId (see Product.js) instead.
 //
-// No vector write here: the vector payload never included
-// availability/stock (only shop, sku, matchKey, ids, title — see
-// vector.service.js), so availability has always
-// been purely a MongoDB concern, checked at search/hydration time.
+// Availability is purely a MongoDB concern, checked at
+// search/hydration time; the shop's cached JEV catalog is
+// dropped so the next search sees the new stock.
 //
 // Known simplification: `available > 0` is used as a stand-in for
 // Shopify's real availableForSale, which also accounts for a

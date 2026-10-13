@@ -2,14 +2,12 @@
 // JEV — FAST RELEVANCE LAYER
 // =========================================================
 //
-// Phase 1 (current): JEV is not a separate model or API call.
-// It reuses the semantic similarity scores vector search already
-// computed during retrieval (via the Qwen embedding model,
-// see search.service.js's findSemanticCandidates and
-// embedding.service.js) — no new network call, no new latency,
-// no new dependency. If a dedicated JEV model/service is
-// introduced later, this file is the one place that needs to
-// change; nothing else in the app should need to know.
+// JEV is the app's own relevance engine — no embedding model,
+// no network call. jev-index.service.js scores each product
+// against the query's words in memory (field weights, word
+// rarity, partial words, typos) and sets _semanticScore (0..1);
+// this file decides what those scores mean. Understanding
+// meaning beyond the words is left to the AI model (GLM).
 //
 // ACTIVE (no longer shadow mode). JEV's scores are used in
 // search.service.js to:
@@ -62,9 +60,9 @@ const BOOST_RELEVANCE_MIN_SCORE = Number(
 );
 
 /*
- * Only candidates that came from semantic retrieval carry a
- * _semanticScore (see findSemanticCandidates) — a candidate
- * found only through MongoDB word-matching has no meaning-based
+ * Only candidates JEV scored carry a _semanticScore (see
+ * findSemanticCandidates) — a candidate found only through
+ * MongoDB's text search, or added for the AI model, has no JEV
  * score to judge, so it is treated as "not selected" by JEV
  * rather than guessed at. That is exactly why this stays a
  * narrowing signal alongside lexical search, never a

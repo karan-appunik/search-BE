@@ -5,7 +5,7 @@ const {
 } = require("../middleware/internal-auth");
 
 const {
-  syncProductsAndRefreshVectors,
+  syncProducts,
   webhookUpsertProduct,
   webhookDeleteProduct
 } = require(
@@ -17,7 +17,7 @@ const router = express.Router();
 router.post(
   "/products/sync",
   internalAuth,
-  syncProductsAndRefreshVectors
+  syncProducts
 );
 
 router.post(

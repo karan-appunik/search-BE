@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
-    "index:products": "node scripts/index-products.js"
+    "cleanup:embeddings": "node scripts/remove-embeddings.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

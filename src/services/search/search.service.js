@@ -7,14 +7,10 @@
       require("../ai/ai.service");
 
     const {
-      createEmbedding
+      scoreShopProducts,
+      getInStockProducts
     } =
-      require("../ai/embedding.service");
-
-    const {
-      searchByVector
-    } =
-      require("./vector.service");
+      require("./jev-index.service");
 
     const {
       getJevSelection,
@@ -36,25 +32,8 @@
       require("../goal/goal.service");
 
 
-    // =========================================================
-    // EMBEDDING / SEMANTIC CACHE
-    // =========================================================
-    //
-    // Query embeddings are deterministic for the same model.
-    // Keep a small in-memory cache so repeated/revisited queries
-    // do not make Ollama run Qwen again. In-flight requests are
-    // also shared so concurrent identical queries create only one
-    // embedding request.
-    //
-    // This does NOT change ranking or AI behavior.
-    // =========================================================
-
-    const EMBEDDING_CACHE_TTL_MS = 5 * 60 * 1000;
-    const EMBEDDING_CACHE_MAX = 200;
-
-    // Vector cosine-similarity scores are used only for the second-stage
-    // semantic fallback. Keep this configurable so the threshold can be
-    // tuned from .env without changing the search code.
+    // JEV relevance scores (0..1) at/above this pick the in-stock
+    // alternatives when nothing else matched. Configurable from .env.
     const SEMANTIC_FALLBACK_MIN_SCORE = Number(
       process.env.SEMANTIC_FALLBACK_MIN_SCORE || "0.30"
     );
@@ -92,85 +71,6 @@
         "availableForSale",
         "inventoryQuantity"
       ].join(" ");
-
-    const embeddingCache = new Map();
-    const embeddingInFlight = new Map();
-
-    function normalizeEmbeddingKey(query) {
-      return String(query || "")
-        .trim()
-        .replace(/\s+/g, " ")
-        .toLowerCase();
-    }
-
-    function getCachedEmbedding(query) {
-      const key = normalizeEmbeddingKey(query);
-      const entry = embeddingCache.get(key);
-
-      if (!entry) {
-        return null;
-      }
-
-      if (Date.now() - entry.time > EMBEDDING_CACHE_TTL_MS) {
-        embeddingCache.delete(key);
-        return null;
-      }
-
-      // LRU touch.
-      embeddingCache.delete(key);
-      embeddingCache.set(key, entry);
-
-      console.log("[EMBEDDING] Cache hit:", key);
-      return entry.embedding;
-    }
-
-    function setCachedEmbedding(query, embedding) {
-      const key = normalizeEmbeddingKey(query);
-
-      embeddingCache.delete(key);
-      embeddingCache.set(key, {
-        embedding,
-        time: Date.now()
-      });
-
-      while (embeddingCache.size > EMBEDDING_CACHE_MAX) {
-        const oldestKey = embeddingCache.keys().next().value;
-        if (oldestKey === undefined) break;
-        embeddingCache.delete(oldestKey);
-      }
-    }
-
-    async function getEmbedding(query) {
-      const cached = getCachedEmbedding(query);
-      if (cached) {
-        return cached;
-      }
-
-      const key = normalizeEmbeddingKey(query);
-      const existing = embeddingInFlight.get(key);
-
-      if (existing) {
-        console.log("[EMBEDDING] Reusing in-flight embedding:", key);
-        return existing;
-      }
-
-      const promise = createEmbedding(query)
-        .then(embedding => {
-          if (Array.isArray(embedding) && embedding.length) {
-            setCachedEmbedding(query, embedding);
-          }
-          return embedding;
-        })
-        .finally(() => {
-          if (embeddingInFlight.get(key) === promise) {
-            embeddingInFlight.delete(key);
-          }
-        });
-
-      embeddingInFlight.set(key, promise);
-      return promise;
-    }
-
 
     // =========================================================
     // QUERY NORMALIZATION
@@ -703,255 +603,55 @@
     }
 
     // =========================================================
-    // SEMANTIC CANDIDATES
+    // JEV CANDIDATES
     // =========================================================
     //
-    // Qwen converts the customer query into a vector.
-    // Vector search (vector.service.js) finds semantically similar products.
-    // MongoDB then loads the complete product records.
-    //
-    // If vector search is unavailable, return [] so the existing
-    // lexical search can continue working.
+    // JEV scores the shop's whole catalog in memory against the
+    // query's meaningful words (see jev-index.service.js) — no
+    // model call. Each result carries _semanticScore (0..1), the
+    // relevance score the rest of search uses. Never throws: if
+    // scoring fails, lexical search and the AI model carry on.
     // =========================================================
-
-    /*
-     * The instant (JEV) and AI requests for the same search arrive
-     * together; both need the same similarity search. Run it once
-     * per shop + query (at the larger size) and share the result
-     * for a few seconds.
-     */
-    const SEMANTIC_SHARE_MS = 15 * 1000;
-    const SEMANTIC_SHARED_LIMIT = 30;
-    const semanticShared = new Map();
 
     async function findSemanticCandidates({
       shop,
       query,
       limit = 16
     }) {
-      const key = `${shop}::${String(query || "").trim().toLowerCase()}`;
-      const size = Math.max(limit, SEMANTIC_SHARED_LIMIT);
-      const existing = semanticShared.get(key);
-
-      if (
-        existing &&
-        existing.size >= limit &&
-        Date.now() - existing.startedAt < SEMANTIC_SHARE_MS
-      ) {
-        return (await existing.promise).slice(0, limit);
-      }
-
-      const entry = {
-        startedAt: Date.now(),
-        size,
-        promise: runSemanticSearch({ shop, query, limit: size })
-      };
-
-      semanticShared.set(key, entry);
-
-      // keep the map small: drop expired entries
-      for (const [k, v] of semanticShared) {
-        if (Date.now() - v.startedAt > SEMANTIC_SHARE_MS) {
-          semanticShared.delete(k);
-        }
-      }
-
-      return (await entry.promise).slice(0, limit);
-    }
-
-    async function runSemanticSearch({
-      shop,
-      query,
-      limit = 16
-    }) {
       try {
+        const startedAt = Date.now();
 
-        const startedAt =
-          Date.now();
-
-
-        const embedding =
-          await getEmbedding(
-            query
-          );
-
-
-        if (
-          !embedding.length
-        ) {
-
-          console.warn(
-            "[SEARCH SERVICE] Empty query embedding"
-          );
-
-          return [];
-        }
-
-
-        const vectorResults =
-          await searchByVector(
-            embedding,
-            {
-              shop,
-              limit
-            }
-          );
-
-
-        const semanticPoints =
-          vectorResults
-            .map(point => ({
-              sku: String(
-                point?.payload?.matchKey ||
-                point?.payload?.sku ||
-                ""
-              ).trim(),
-              score: Number(point?.score)
-            }))
-            .filter(item => item.sku);
-
-        const semanticScoreMap = new Map();
-
-        for (const item of semanticPoints) {
-          if (!semanticScoreMap.has(item.sku)) {
-            semanticScoreMap.set(item.sku, item.score);
-          }
-        }
-
-        const uniqueSkus =
-          [...new Set(
-            semanticPoints.map(item => item.sku)
-          )];
-
-
-        if (
-          !uniqueSkus.length
-        ) {
-
-          console.log(
-            "[SEARCH SERVICE] Semantic candidates: 0"
-          );
-
-          return [];
-        }
-
-
-        const products =
-          await Product.find({
-            shop,
-
-            matchKey: {
-              $in:
-                uniqueSkus
-            }
-          })
-
-            .select(
-              [
-                "shop",
-                "sku",
-                "matchKey",
-                "shopifyProductId",
-                "shopifyVariantId",
-                "title",
-                "variantTitle",
-                "variantOptions",
-                "barcode",
-                "description",
-                "productType",
-                "vendor",
-                "tags",
-                "ingredients",
-                "benefits",
-                "features",
-                "price",
-                "compareAtPrice",
-                "currency",
-                "image",
-                "images",
-                "handle",
-                "productUrl",
-                "availableForSale",
-                "inventoryQuantity"
-              ].join(" ")
-            )
-
-            .lean();
-
-
-        const productMap =
-          new Map(
-            products.map(
-              product => [
-                productKey(product),
-                product
-              ]
-            )
-          );
-
-
-        /*
-         * Keep vector similarity order.
-         */
-        const ordered =
-          uniqueSkus
-            .map(
-              sku => {
-                const product = productMap.get(sku);
-                if (!product) return null;
-
-                return {
-                  ...product,
-                  _semanticScore: semanticScoreMap.get(sku)
-                };
-              }
-            )
-            .filter(Boolean);
-
+        const ordered = await scoreShopProducts({
+          shop,
+          queryWords: getMeaningfulQueryTokens(query),
+          limit
+        });
 
         console.log(
-          `[SEARCH SERVICE] Semantic search: ${
-            Date.now() -
-            startedAt
-          }ms`
-        );
-
-
-        console.log(
-          `[SEARCH SERVICE] Semantic: ${ordered.length} candidates` +
+          `[SEARCH SERVICE] JEV scoring: ${Date.now() - startedAt}ms, ${ordered.length} candidates` +
           (ordered.length
             ? ` | top: ${ordered.slice(0, 5).map(p => `${p?.title} (${Number(p?._semanticScore).toFixed(2)})`).join(", ")}`
             : "")
         );
 
-
         return ordered;
-
-      } catch (
-        error
-      ) {
-
+      } catch (error) {
         console.warn(
-          "[SEARCH SERVICE] Semantic search unavailable:",
+          "[SEARCH SERVICE] JEV scoring unavailable:",
           error.message
         );
 
-
-        /*
-         * Important:
-         *
-         * Semantic search must never break
-         * the existing AI search.
-         */
         return [];
       }
     }
+
+
     // =========================================================
     // PRODUCT IDENTITY
     // =========================================================
     //
     // matchKey is the product's real SKU, or "variant:<gid>" when
-    // the merchant never entered one. It is what vector search, goals and
+    // the merchant never entered one. It is what JEV, goals and
     // the AI catalog key on; product.sku stays the display value.
     // Falls back to sku for documents synced before matchKey.
     // =========================================================
@@ -1500,7 +1200,7 @@
        *
        * We use a generic title-overlap check as evidence that the customer's
        * query had a concrete/direct catalog match. This contains no
-       * product-category or domain-specific vocabulary. Qwen vector search remains
+       * product-category or domain-specific vocabulary. JEV scoring remains
        * candidate generation only and does not decide this.
        */
       const directMatchCandidates = [
@@ -1571,12 +1271,12 @@
        * requested product. Only when every selected direct match is
        * unavailable do we enter this fallback path.
        *
-       * Qwen vector search is used here specifically to find semantically
-       * similar alternatives. We do NOT ask the LLM to invent/rerank the
+       * JEV scores are used here specifically to find similar
+       * alternatives. We do NOT ask the LLM to invent/rerank the
        * fallback list.
        */
       // Reuse the semantic candidates already retrieved for this request.
-      // This avoids a second embedding/vector call and keeps preview fast.
+      // This avoids scoring twice and keeps preview fast.
       console.log(
         "[SEARCH SERVICE] Reusing semantic alternatives:",
         (semanticCandidates || []).length
@@ -1653,7 +1353,7 @@
        * The AI model makes the final relevance decision.
        *
        * We therefore use cheap lexical/prefix retrieval together with
-       * Qwen vector retrieval to produce a bounded candidate
+       * JEV relevance scoring to produce a bounded candidate
        * set. No product-category or domain-specific rules are used here.
        */
       const prefixPromise = findPrefixCandidates({
@@ -2235,7 +1935,7 @@
     //   1. the most similar ones retrieval already loaded for
     //      this query (no extra work), else
     //   2. a few in-stock products from one indexed query — only
-    //      when retrieval had nothing usable (e.g. embeddings down).
+    //      when retrieval had nothing usable.
     // Products the merchant's Exclude rule hides never appear.
     // =========================================================
 
@@ -2246,7 +1946,10 @@
       goal,
       forcedBoostCandidates,
       semanticCandidates,
-      lexicalCandidates
+      lexicalCandidates,
+      // false for instant results: never pad with unrelated
+      // catalog products; the AI answer follows anyway.
+      allowCatalogFallback = true
     }) {
       const excluded =
         isApplicableGoal(goal) && goal.ruleType === "exclude"
@@ -2274,7 +1977,7 @@
         })
         .slice(0, RULE_RESULT_LIMIT);
 
-      if (!alternatives.length) {
+      if (!alternatives.length && allowCatalogFallback) {
         alternatives = await Product.find({
           shop,
           availableForSale: true,
@@ -2379,6 +2082,13 @@
      */
     const AI_CANDIDATE_LIMIT = 12;
 
+    /*
+     * When no product matches the query's words confidently (e.g.
+     * "something warm for winter"), JEV can't judge meaning; the AI
+     * model then sees up to this many in-stock products instead.
+     */
+    const AI_BROAD_CANDIDATE_LIMIT = 40;
+
     function selectTopCandidatesForAI({
       query,
       candidates,
@@ -2469,9 +2179,10 @@
     //
     //   1. exact SKU short-circuit
     //   2. active merchant rule + its boost targets
-    //   3. retrieval (lexical + semantic), JEV narrowing
-    //   4. ranking: preview = retrieval scores only (no LLM),
-    //      final = GLM + availability + semantic fallback
+    //   3. retrieval (lexical + JEV scoring), JEV narrowing
+    //   4. ranking: preview = JEV scores only (no LLM),
+    //      final = GLM (wider in-stock catalog when no confident
+    //      word match) + availability + JEV fallback
     //   5. merchant rule (boost / exclude / demote) + cap
     // =========================================================
 
@@ -2623,12 +2334,23 @@
               result: await buildAlternativeResult({
                 shop,
                 query: cleanQuery,
-                // semantic first: they are ordered by similarity
-                candidates: [...semanticCandidates, ...candidates],
+                /*
+                 * Instant results only offer alternatives JEV
+                 * actually found similar. With no word match
+                 * (e.g. "something warm for winter") this stays
+                 * empty: the storefront keeps "Looking for best
+                 * result..." and the AI answers by meaning.
+                 */
+                candidates: aiSkipped
+                  ? [...semanticCandidates, ...candidates]
+                  : semanticCandidates.filter(product =>
+                      Number(product?._semanticScore) >= SEMANTIC_FALLBACK_MIN_SCORE
+                    ),
                 goal: activeGoal,
                 forcedBoostCandidates,
                 semanticCandidates,
-                lexicalCandidates
+                lexicalCandidates,
+                allowCatalogFallback: aiSkipped
               })
             });
           }
@@ -2673,7 +2395,17 @@
           30 + forcedBoostCandidates.length
         );
 
-        if (!retrieved.length) {
+        // Meaning search: no confident word match, so the AI model
+        // judges the in-stock catalog by meaning.
+        const meaningSearch = !semanticCandidates.some(product =>
+          Number(product?._semanticScore) >= BOOST_RELEVANCE_MIN_SCORE
+        );
+
+        const broadCatalog = meaningSearch
+          ? await getInStockProducts(shop, AI_BROAD_CANDIDATE_LIMIT).catch(() => [])
+          : [];
+
+        if (!retrieved.length && !broadCatalog.length) {
           return buildAlternativeResult({
             shop,
             query: cleanQuery,
@@ -2693,12 +2425,20 @@
           forcedBoostCandidates
         });
 
+        const withBroadCatalog = broadCatalog.length
+          ? mergeCandidates(
+              rawCandidatesForGlm,
+              broadCatalog,
+              rawCandidatesForGlm.length + broadCatalog.length
+            )
+          : rawCandidatesForGlm;
+
         const candidatesForGlm = (() => {
           if (!isApplicableGoal(activeGoal) || activeGoal.ruleType !== "exclude") {
-            return rawCandidatesForGlm;
+            return withBroadCatalog;
           }
           const excludedSet = new Set(activeGoal.skus);
-          return rawCandidatesForGlm.filter(p => !excludedSet.has(productKey(p)));
+          return withBroadCatalog.filter(p => !excludedSet.has(productKey(p)));
         })();
 
         logJevShadowSelection({
@@ -2724,7 +2464,8 @@
                 query: cleanQuery,
                 candidates: candidatesForGlm,
                 lexicalCandidates,
-                semanticCandidates
+                semanticCandidates,
+                limit: meaningSearch ? AI_BROAD_CANDIDATE_LIMIT : AI_CANDIDATE_LIMIT
               })
             )
           });
