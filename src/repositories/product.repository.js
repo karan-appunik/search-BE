@@ -105,16 +105,39 @@ async function getLastSyncedAt(shop) {
   return latest?.updatedAt || null;
 }
 
+/*
+ * Counts PRODUCTS (as in Shopify admin), not variant documents:
+ * a product is available when at least one of its variants is.
+ * Variant totals are returned separately.
+ */
 async function countAvailabilityByShop(shop) {
-  const [total, available] = await Promise.all([
+  const [products, variantsTotal, variantsAvailable] = await Promise.all([
+    Product.aggregate([
+      { $match: { shop } },
+      { $group: { _id: "$shopifyProductId", available: { $max: "$availableForSale" } } },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: 1 },
+          available: { $sum: { $cond: ["$available", 1, 0] } }
+        }
+      }
+    ]),
     Product.countDocuments({ shop }),
     Product.countDocuments({ shop, availableForSale: true })
   ]);
 
+  const total = products[0]?.total || 0;
+  const available = products[0]?.available || 0;
+
   return {
     total,
     available,
-    unavailable: total - available
+    unavailable: total - available,
+    variants: {
+      total: variantsTotal,
+      available: variantsAvailable
+    }
   };
 }
 

@@ -186,11 +186,15 @@ const syncProducts = async (req, res) => {
     }
 
 
+    // synced counts VARIANTS (one document per variant);
+    // syncedProductIds counts the distinct Shopify products.
     let synced = 0;
 
     let skipped = 0;
 
     const skippedItems = [];
+
+    const syncedProductIds = new Set();
 
 
     /*
@@ -264,6 +268,8 @@ const syncProducts = async (req, res) => {
 
         synced++;
 
+        syncedProductIds.add(product.id);
+
       }
 
     }
@@ -296,6 +302,12 @@ const syncProducts = async (req, res) => {
 
     };
 
+
+    // Products whose last variant is being removed (no longer
+    // active in Shopify, or deleted there).
+    const removedProductIds = (
+      await Product.distinct("shopifyProductId", staleFilter)
+    ).filter(id => !syncedProductIds.has(id));
 
     const deleteResult =
       await Product.deleteMany(
@@ -345,6 +357,15 @@ const syncProducts = async (req, res) => {
       data: {
 
         synced,
+
+        variantsSynced:
+          synced,
+
+        productsSynced:
+          syncedProductIds.size,
+
+        productsRemoved:
+          removedProductIds.length,
 
         skipped,
 
