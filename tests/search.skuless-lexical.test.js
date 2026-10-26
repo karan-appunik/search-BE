@@ -1,7 +1,5 @@
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-require("dotenv").config();
-
 const mongoose = require("mongoose");
 const Product = require("../src/models/Product");
 const {

@@ -33,7 +33,7 @@
 
 
     // JEV relevance scores (0..1) at/above this pick the in-stock
-    // alternatives when nothing else matched. Configurable from .env.
+    // alternatives when nothing else matched. Configurable with an environment variable.
     const SEMANTIC_FALLBACK_MIN_SCORE = Number(
       process.env.SEMANTIC_FALLBACK_MIN_SCORE || "0.30"
     );
