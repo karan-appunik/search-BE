@@ -301,6 +301,9 @@
               "inventoryQuantity"
             ].join(" ")
           )
+          // Stable order, so identical searches get identical
+          // candidates when more than the limit match.
+          .sort({ _id: 1 })
           .limit(Math.max(1, Math.min(24, limit)))
           .lean();
 
@@ -421,6 +424,9 @@
               "inventoryQuantity"
             ].join(" ")
           )
+          // Stable order, so identical searches get identical
+          // candidates when more than 24 products match.
+          .sort({ _id: 1 })
           .limit(24)
           .lean();
 
@@ -667,6 +673,37 @@
     }
 
 
+    /*
+     * Shoppers see products, not variants: a product with five
+     * variants must take one result slot, not five. Keeps the
+     * first (best-ranked) variant of each Shopify product, in
+     * order. Products without a product id/handle are kept
+     * as-is (keyed by their own matchKey).
+     */
+    function onePerProduct(products) {
+      const seen = new Set();
+
+      return (Array.isArray(products) ? products : []).filter(product => {
+        const id = String(
+          product?.shopifyProductId ||
+          product?.handle ||
+          productKey(product)
+        ).trim();
+
+        if (!id) {
+          return true;
+        }
+
+        if (seen.has(id)) {
+          return false;
+        }
+
+        seen.add(id);
+        return true;
+      });
+    }
+
+
     // =========================================================
     // MERGE HYBRID CANDIDATES
     // =========================================================
@@ -883,7 +920,11 @@
             score: {
               $meta:
                 "textScore"
-            }
+            },
+            // Stable order for tied scores (variants of one
+            // product), so identical searches get identical
+            // candidates.
+            _id: 1
           })
 
           .limit(16)
@@ -1181,6 +1222,21 @@
       lexicalCandidates,
       aiResult
     }) {
+      /*
+       * The AI's closest picks when nothing matched (see
+       * lowConfidence in ai.service.js) stay labelled as
+       * alternatives, so the storefront shows "We didn't find
+       * exactly that..." instead of presenting them as matches.
+       * Sold-out ones are still removed later, as for any result.
+       */
+      if (aiResult?.lowConfidence) {
+        return {
+          ...aiResult,
+          resultType: "alternative",
+          message: aiResult.message || FALLBACK_MESSAGE
+        };
+      }
+
       const recommendations = Array.isArray(
         aiResult?.recommendations
       )
@@ -1538,13 +1594,56 @@
      * goal handed to applyGoalRule so they are never promoted.
      * Returns the same references for anything but an active
      * Boost rule.
+     *
+     * With `query`, a lexical match only counts when a search
+     * word is in the product's title, type, tags, vendor or
+     * variant name — not just somewhere in its description
+     * (slippers whose description says "enjoy your morning
+     * coffee" are not a "coffee cup"). Without `query` the
+     * original rule applies (any lexical match).
      */
+    function boostWordMatch(query, product) {
+      const queryTokens = getMeaningfulQueryTokens(query)
+        .map(normalizeMatchToken)
+        .filter(Boolean);
+
+      if (!queryTokens.length || !product) {
+        return false;
+      }
+
+      const toTokens = value =>
+        (Array.isArray(value) ? value : [value])
+          .map(item =>
+            item && typeof item === "object"
+              ? Object.values(item).join(" ")
+              : String(item ?? "")
+          )
+          .join(" ")
+          .toLowerCase()
+          .replace(/[^a-z0-9\s-]/g, " ")
+          .split(/[\s-]+/)
+          .map(normalizeMatchToken)
+          .filter(Boolean);
+
+      const fieldTokens = new Set([
+        ...toTokens(product.title),
+        ...toTokens(product.productType),
+        ...toTokens(product.tags),
+        ...toTokens(product.vendor),
+        ...toTokens(product.variantTitle),
+        ...toTokens(product.variantOptions)
+      ]);
+
+      return queryTokens.some(token => fieldTokens.has(token));
+    }
+
     function ensureBoostedProductsPresent({
       products,
       goal,
       forcedBoostCandidates,
       semanticCandidates,
-      lexicalCandidates
+      lexicalCandidates,
+      query = null
     }) {
       if (
         !goal ||
@@ -1573,8 +1672,26 @@
         (lexicalCandidates || []).map(productKey).filter(Boolean)
       );
 
+      // Product data for the stricter word check (see boostWordMatch).
+      const productsByKey = new Map();
+
+      for (const candidate of [
+        ...(forcedBoostCandidates || []),
+        ...(lexicalCandidates || [])
+      ]) {
+        const key = productKey(candidate);
+
+        if (key && !productsByKey.has(key)) {
+          productsByKey.set(key, candidate);
+        }
+      }
+
+      const lexicallyRelevant = key =>
+        lexicalKeys.has(key) &&
+        (query == null || boostWordMatch(query, productsByKey.get(key)));
+
       const isRelevant = key =>
-        lexicalKeys.has(key) ||
+        lexicallyRelevant(key) ||
         (semanticScores.get(key) ?? -Infinity) >= BOOST_RELEVANCE_MIN_SCORE;
 
       const adjustedGoal = {
@@ -1729,6 +1846,25 @@
       }
 
       semantic.sort((a, b) => b._semanticScore - a._semanticScore);
+
+      /*
+       * Word matches in order of how strong the match is: query in
+       * the title first, then in type/tags/vendor/variant, then
+       * description-only (slippers whose description mentions
+       * "morning coffee" must not come before the coffee cup).
+       * Stable: the original order is kept within each group.
+       */
+      const matchStrength = product =>
+        titleMatchesQuery(query, product) ? 0
+          : boostWordMatch(query, product) ? 1
+            : 2;
+
+      lexical
+        .map((product, index) => ({ product, index, strength: matchStrength(product) }))
+        .sort((a, b) => a.strength - b.strength || a.index - b.index)
+        .forEach((item, position) => {
+          lexical[position] = item.product;
+        });
 
       /*
        * When the query literally matches products, a weak
@@ -1959,33 +2095,42 @@
       const excludedSet = new Set(excluded);
       const seen = new Set();
 
-      let alternatives = (candidates || [])
-        .filter(product => {
-          const key = productKey(product);
+      // In-stock and not excluded first, then one per product,
+      // so a sold-out first variant can't hide an in-stock one.
+      let alternatives = onePerProduct(
+        (candidates || [])
+          .filter(product => {
+            const key = productKey(product);
 
-          if (
-            !key ||
-            seen.has(key) ||
-            product.availableForSale !== true ||
-            excludedSet.has(key)
-          ) {
-            return false;
-          }
+            if (
+              !key ||
+              seen.has(key) ||
+              product.availableForSale !== true ||
+              excludedSet.has(key)
+            ) {
+              return false;
+            }
 
-          seen.add(key);
-          return true;
-        })
-        .slice(0, RULE_RESULT_LIMIT);
+            seen.add(key);
+            return true;
+          })
+      ).slice(0, RULE_RESULT_LIMIT);
 
       if (!alternatives.length && allowCatalogFallback) {
-        alternatives = await Product.find({
-          shop,
-          availableForSale: true,
-          ...(excluded.length ? { matchKey: { $nin: excluded } } : {})
-        })
-          .select(PRODUCT_FIELDS)
-          .limit(RULE_RESULT_LIMIT)
-          .lean();
+        /*
+         * Read a few extra rows so variants of one product
+         * don't fill every slot, then keep one per product.
+         */
+        alternatives = onePerProduct(
+          await Product.find({
+            shop,
+            availableForSale: true,
+            ...(excluded.length ? { matchKey: { $nin: excluded } } : {})
+          })
+            .select(PRODUCT_FIELDS)
+            .limit(RULE_RESULT_LIMIT * 8)
+            .lean()
+        ).slice(0, RULE_RESULT_LIMIT);
       }
 
       const products = applyMerchantRule({
@@ -1998,7 +2143,8 @@
         forcedBoostCandidates,
         semanticCandidates,
         lexicalCandidates,
-        limit: RULE_RESULT_LIMIT
+        limit: RULE_RESULT_LIMIT,
+        query
       });
 
       if (!products.length) {
@@ -2035,7 +2181,8 @@
       forcedBoostCandidates,
       semanticCandidates,
       lexicalCandidates,
-      limit
+      limit,
+      query = null
     }) {
       const {
         products: natural,
@@ -2045,7 +2192,8 @@
         goal,
         forcedBoostCandidates,
         semanticCandidates,
-        lexicalCandidates
+        lexicalCandidates,
+        query
       });
 
       const ruleApplied = applyGoalRule({
@@ -2053,12 +2201,15 @@
         goal: adjustedGoal
       });
 
-      return applyDemoteVisibilityCap({
-        naturalRankedProducts: natural || [],
-        ruleAppliedProducts: ruleApplied,
+      // One slot per product, before the cap (so the cap keeps
+      // more distinct products instead of repeated variants),
+      // and once more after it (Demote on one variant only).
+      return onePerProduct(applyDemoteVisibilityCap({
+        naturalRankedProducts: onePerProduct(natural || []),
+        ruleAppliedProducts: onePerProduct(ruleApplied),
         goal: adjustedGoal,
         limit
-      });
+      }));
     }
 
 
@@ -2120,7 +2271,19 @@
       return (candidates || [])
         .filter(product => product?.availableForSale === true)
         .map(rank)
-        .sort((a, b) => a.tier - b.tier || b.score - a.score)
+        /*
+         * Last tiebreaker: the product key. Database results for
+         * the same search can come back in a different order, and
+         * without it each search could pick a different (tied)
+         * variant of the same product, so the AI's cached answer
+         * was missed and results could change between identical
+         * searches.
+         */
+        .sort((a, b) =>
+          a.tier - b.tier ||
+          b.score - a.score ||
+          productKey(a.product).localeCompare(productKey(b.product))
+        )
         .filter(({ product }) => {
           // one variant per Shopify product (best-ranked one)
           const productId = product.shopifyProductId || productKey(product);
@@ -2320,7 +2483,8 @@
             forcedBoostCandidates,
             semanticCandidates,
             lexicalCandidates,
-            limit: RULE_RESULT_LIMIT
+            limit: RULE_RESULT_LIMIT,
+            query: cleanQuery
           });
 
           console.log(`[SEARCH TIMING] PREVIEW TOTAL: ${Date.now() - startedAt}ms`);
@@ -2578,7 +2742,9 @@
         const hydrated = await hydrateRecommendations({
           shop,
           recommendations: aiResult?.recommendations,
-          minScore: 30
+          // The AI's low-confidence closest picks were already
+          // limited to its own alternative floor (ai.service.js).
+          minScore: aiResult?.lowConfidence ? 0 : 30
         });
 
         // Same as preview: never list a sold-out product.
@@ -2625,7 +2791,8 @@
           forcedBoostCandidates,
           semanticCandidates,
           lexicalCandidates,
-          limit: Math.max(verified.length, 1) + forcedBoostCandidates.length
+          limit: Math.max(verified.length, 1) + forcedBoostCandidates.length,
+          query: cleanQuery
         });
 
         console.log(`[SEARCH TIMING] FINAL TOTAL: ${Date.now() - startedAt}ms`);

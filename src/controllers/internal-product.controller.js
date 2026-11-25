@@ -6,6 +6,13 @@ const {
   invalidateShop
 } = require("../services/search/jev-index.service");
 
+// ...and forgets its AI answers (in memory and stored), so no
+// answer outlives a product change (fire-and-forget, never fails
+// the write).
+const {
+  forgetShopAnswers
+} = require("../services/ai/ai.service");
+
 
 /*
  * ---------------------------------------------------------
@@ -319,6 +326,7 @@ const syncProducts = async (req, res) => {
       deleteResult.deletedCount || 0;
 
     invalidateShop(shop);
+    forgetShopAnswers(shop);
 
 
     /*
@@ -472,6 +480,7 @@ const webhookUpsertProduct = async (req, res) => {
 
 
     invalidateShop(shop);
+    forgetShopAnswers(shop);
 
     console.log("[PRODUCT WEBHOOK] Upsert", {
       shop,
@@ -529,6 +538,7 @@ const webhookDeleteProduct = async (req, res) => {
       deleteResult.deletedCount || 0;
 
     invalidateShop(shop);
+    forgetShopAnswers(shop);
 
 
     console.log("[PRODUCT WEBHOOK] Delete", {
