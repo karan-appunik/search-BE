@@ -10,6 +10,10 @@ const {
     internalAuth
 } = require("../middleware/internal-auth");
 
+const {
+    getStorefrontCatalog
+} = require("../services/search/storefront-catalog.service");
+
 const router =
     express.Router();
 
@@ -22,6 +26,48 @@ const router =
  */
 router.use(
     internalAuth
+);
+
+
+/*
+ * Compact in-stock product list for instant results while typing
+ * (see storefront-catalog.service.js). Read-only.
+ */
+router.get(
+    "/catalog",
+    async (req, res) => {
+
+        try {
+
+            const shop =
+                String(req.query.shop || "").trim();
+
+            if (!shop) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Shop is required"
+                });
+            }
+
+            const catalog =
+                await getStorefrontCatalog(shop);
+
+            return res.status(200).json({
+                success: true,
+                ...catalog
+            });
+
+        } catch (error) {
+
+            console.error("[STOREFRONT CATALOG ERROR]", error);
+
+            // The storefront just keeps its normal search flow.
+            return res.status(500).json({
+                success: false,
+                enabled: false
+            });
+        }
+    }
 );
 
 

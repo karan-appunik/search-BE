@@ -43,6 +43,7 @@ const LIST_FIELDS =
     "currency",
     "availableForSale",
     "inventoryQuantity",
+    "productType",
     "shopifyProductId",
     "shopifyVariantId"
   ].join(" ");
@@ -129,16 +130,63 @@ function clampInt(
 // session does not run every query twice.
 // =========================================================
 
+/*
+ * Optional sort orders for the admin picker. "title_asc" is
+ * the original order and the default. Every order ends with
+ * the same tiebreakers so pagination stays stable.
+ */
+const SORTS = {
+  title_asc: { title: 1, sku: 1, _id: 1 },
+  title_desc: { title: -1, sku: 1, _id: 1 },
+  price_asc: { price: 1, title: 1, sku: 1, _id: 1 },
+  price_desc: { price: -1, title: 1, sku: 1, _id: 1 }
+};
+
+const DEFAULT_SORT = "title_asc";
+
+function normalizeSort(value) {
+
+  const key =
+    String(value || "").trim();
+
+  return Object.prototype.hasOwnProperty.call(SORTS, key)
+    ? key
+    : DEFAULT_SORT;
+}
+
+
 async function listGoalProducts({
   shop,
   page,
   limit,
-  search
+  search,
+  sort,
+  inStock = false,
+  productType = ""
 }) {
 
   const filter = {
     shop
   };
+
+
+  // Optional filters. Absent = same results as before.
+  if (inStock) {
+
+    filter.availableForSale = true;
+  }
+
+
+  const cleanType =
+    String(
+      productType || ""
+    ).trim().slice(0, 200);
+
+
+  if (cleanType) {
+
+    filter.productType = cleanType;
+  }
 
 
   const cleanSearch =
@@ -178,11 +226,9 @@ async function listGoalProducts({
        * an extra tiebreaker so pagination stays stable when
        * titles repeat.
        */
-      .sort({
-        title: 1,
-        sku: 1,
-        _id: 1
-      })
+      .sort(
+        SORTS[normalizeSort(sort)]
+      )
 
       .skip(skip)
 
@@ -214,9 +260,37 @@ async function listGoalProducts({
 }
 
 
+/*
+ * Product types that exist in this shop's synced catalog, for
+ * the picker's "Product type" filter (like a theme's filter
+ * list: only real values, alphabetical).
+ */
+async function listProductTypes(shop, { inStock = false } = {}) {
+
+  const types =
+    await Product.distinct(
+      "productType",
+      inStock
+        ? { shop, availableForSale: true }
+        : { shop }
+    );
+
+  return Array.from(
+    new Set(
+      types
+        .map(type => String(type || "").trim())
+        .filter(Boolean)
+    )
+  ).sort((a, b) => a.localeCompare(b));
+}
+
+
 module.exports = {
   DEFAULT_LIMIT,
   MAX_LIMIT,
+  SORTS,
   clampInt,
-  listGoalProducts
+  listGoalProducts,
+  listProductTypes,
+  normalizeSort
 };

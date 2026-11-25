@@ -166,7 +166,7 @@ app.get(
         true,
 
       message:
-        "AI Product Search Backend is running"
+        "Askmerce Backend is running"
 
     });
 

@@ -1,6 +1,7 @@
 const Product = require("../models/Product");
 const { invalidateShop } = require("../services/search/jev-index.service");
 const { deleteGoal } = require("../services/goal/goal.service");
+const { forgetShopAnswers } = require("../services/ai/ai.service");
 
 // =========================================================
 // GDPR: SHOP REDACT
@@ -39,10 +40,14 @@ const redactShop = async (req, res) => {
 
     const goalDeleted = await deleteGoal(shop);
 
+    // AI answers for this shop (in memory and stored)
+    const answersDeleted = await forgetShopAnswers(shop);
+
     console.log("[SHOP REDACT] Complete", {
       shop,
       productsDeleted: deleteResult.deletedCount || 0,
-      goalDeleted
+      goalDeleted,
+      answersDeleted
     });
 
     return res.status(200).json({

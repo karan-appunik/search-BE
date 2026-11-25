@@ -17,6 +17,27 @@ const OLLAMA_MODEL =
   process.env.OLLAMA_MODEL ||
   "glm-5.3-flash:cloud";
 
+// Normal bar for an AI recommendation.
+/*
+ * Longest a shopper waits for the AI model. Normal answers take
+ * about 1-2.5s; past this the search answers with JEV's results
+ * instead (same fallback as any other AI failure). Optional
+ * override: AI_TIMEOUT_MS (1000-30000).
+ */
+const AI_TIMEOUT_MS =
+  Number(process.env.AI_TIMEOUT_MS) >= 1000 &&
+  Number(process.env.AI_TIMEOUT_MS) <= 30000
+    ? Number(process.env.AI_TIMEOUT_MS)
+    : 8000;
+
+const MIN_RECOMMENDATION_SCORE = 50;
+
+// When nothing reaches the normal bar, the AI's closest picks
+// down to this score are kept as low-confidence alternatives
+// (see "VERIFY AI SKUs" below).
+const MIN_ALTERNATIVE_SCORE = 20;
+const MAX_ALTERNATIVE_RECOMMENDATIONS = 4;
+
 
 // =========================================================
 // OLLAMA URL
@@ -75,6 +96,55 @@ const GLM_CACHE_MAX = 500;
 
 const glmCache = new Map();
 const glmInFlight = new Map();
+
+// Second level: answers kept in MongoDB, so they survive restarts.
+const {
+  getStoredAnswer,
+  storeAnswer,
+  clearShopAnswers
+} = require("./answer-cache.service");
+
+/*
+ * Bumped every time a shop's products change. An AI request that
+ * was already running when that happened doesn't save its answer
+ * (it was worked out from the old product data).
+ */
+const shopProductVersion = new Map();
+
+function cacheShopKey(shop) {
+  return String(shop || "").trim().toLowerCase();
+}
+
+function getShopProductVersion(shop) {
+  return shopProductVersion.get(cacheShopKey(shop)) || 0;
+}
+
+/*
+ * A shop's products changed (sync, product webhook, delete) or its
+ * data is being deleted: forget every AI answer for it, in memory
+ * and in MongoDB, so no answer outlives the change.
+ * Resolves to the number of stored (MongoDB) answers removed.
+ */
+function forgetShopAnswers(shop) {
+
+  const shopKey = cacheShopKey(shop);
+
+  if (!shopKey) {
+    return Promise.resolve(0);
+  }
+
+  shopProductVersion.set(shopKey, getShopProductVersion(shopKey) + 1);
+
+  const prefix = `${shopKey}::`;
+
+  for (const key of Array.from(glmCache.keys())) {
+    if (key.startsWith(prefix)) {
+      glmCache.delete(key);
+    }
+  }
+
+  return clearShopAnswers(shopKey);
+}
 
 function getCatalogFingerprint(productCatalog) {
 
@@ -723,6 +793,36 @@ const recommendProducts =
 
     const runGLMRequest = async () => {
 
+    // If the shop's products change while this runs, the answer is
+    // still returned but not cached (see forgetShopAnswers).
+    const productVersionAtStart =
+      getShopProductVersion(shop);
+
+    const productsUnchanged = () =>
+      getShopProductVersion(shop) === productVersionAtStart;
+
+    /*
+     * Answered before (possibly before a restart): reuse the stored
+     * answer instead of asking the AI again. Checked here so
+     * identical searches arriving together share one lookup.
+     */
+    const storedResult =
+      await getStoredAnswer(glmCacheKey);
+
+    if (storedResult && productsUnchanged()) {
+
+      console.log("[AI SERVICE] Stored answer reused (no AI call)");
+
+      setCachedGLMResult(
+        glmCacheKey,
+        storedResult
+      );
+
+      return storedResult;
+
+    }
+
+
     console.log(
       `[AI SERVICE] ${provider} / ${OLLAMA_MODEL}: ${productCatalog.length} products for "${cleanQuery}"`
     );
@@ -767,11 +867,12 @@ Rules:
 - For incomplete or partial queries, make the best useful recommendation from the supplied catalog using the information available so far.
 - Do not require the customer to finish the sentence before recommending products.
 - As the customer adds more words, improve the recommendations.
-- Return no_match only when there is neither a direct match nor a genuinely useful alternative.
+- If no product directly matches, do not return no_match. Instead return the 3 or 4 catalog products closest to what the customer wants (nearest category, purpose, occasion, style, material or color), with resultType alternative and scores from 20 to 49 that show how close each one is.
+- Return no_match only when the catalog has no products.
 - Rank by absolute relevance.
 - Score from 0 to 98. Never use 100.
 - Return at most 6 recommendations.
-- Set resultType to direct for direct matches and alternative only for useful alternatives.
+- Set resultType to direct for direct matches and alternative for closest alternatives.
 - Return ONLY JSON.
 
 Output exactly:
@@ -809,12 +910,13 @@ No match:
       upstream;
 
 
+    // Covers the whole answer (headers and body), see AI_TIMEOUT_MS.
     const timeout =
       setTimeout(
         () => {
           controller.abort();
         },
-        30000
+        AI_TIMEOUT_MS
       );
 
 
@@ -938,11 +1040,13 @@ No match:
           }
         );
 
-    } finally {
+    } catch (error) {
 
       clearTimeout(
         timeout
       );
+
+      throw error;
 
     }
 
@@ -956,6 +1060,10 @@ No match:
       `[AI SERVICE] Ollama response time: ${elapsed}ms`
     );
 
+
+    let data;
+
+    try {
 
     if (
       !response.ok
@@ -977,8 +1085,17 @@ No match:
       );
 
     }
-const data =
-  await response.json();
+
+    data =
+      await response.json();
+
+    } finally {
+
+      clearTimeout(
+        timeout
+      );
+
+    }
 
 
 console.log(
@@ -1090,7 +1207,7 @@ console.log(
         : [];
 
 
-    const cleanedRecommendations =
+    const scoredRecommendations =
       recommendations
 
         .filter(
@@ -1162,22 +1279,56 @@ console.log(
 
         )
 
-        .filter(
-          recommendation =>
-            recommendation.score >=
-            50
-        )
-
         .sort(
           (a, b) =>
             b.score -
             a.score
-        )
+        );
 
+
+    const confidentRecommendations =
+      scoredRecommendations
+        .filter(
+          recommendation =>
+            recommendation.score >=
+            MIN_RECOMMENDATION_SCORE
+        )
         .slice(
           0,
           6
         );
+
+
+    /*
+     * Nothing at the normal bar: keep the AI's own closest picks
+     * (it judged them by meaning, e.g. denim jackets for
+     * "something wintery vibes") as clearly-labelled
+     * alternatives. Discarding them made search fall back to
+     * keyword ranking, which for such queries returned
+     * unrelated products. `lowConfidence` tells search.service
+     * to keep the alternative label and score floor for them.
+     */
+    const lowConfidence =
+      !confidentRecommendations.length &&
+      scoredRecommendations.some(
+        recommendation =>
+          recommendation.score >=
+          MIN_ALTERNATIVE_SCORE
+      );
+
+    const cleanedRecommendations =
+      lowConfidence
+        ? scoredRecommendations
+          .filter(
+            recommendation =>
+              recommendation.score >=
+              MIN_ALTERNATIVE_SCORE
+          )
+          .slice(
+            0,
+            MAX_ALTERNATIVE_RECOMMENDATIONS
+          )
+        : confidentRecommendations;
 
 
     const finalResult = {
@@ -1193,6 +1344,7 @@ console.log(
       resultType:
         cleanedRecommendations.length
           ? (
+            lowConfidence ||
             result?.resultType === "alternative"
               ? "alternative"
               : "direct"
@@ -1204,7 +1356,9 @@ console.log(
           ),
 
       recommendations:
-        cleanedRecommendations
+        cleanedRecommendations,
+
+      ...(lowConfidence ? { lowConfidence: true } : {})
 
     };
 
@@ -1217,10 +1371,17 @@ console.log(
     // A failed answer is never cached: the next search for the
     // same query should try GLM again, not repeat the failure.
     if (
-      finalResult.resultType !== "invalid"
+      finalResult.resultType !== "invalid" &&
+      productsUnchanged()
     ) {
       setCachedGLMResult(
         glmCacheKey,
+        finalResult
+      );
+
+      storeAnswer(
+        glmCacheKey,
+        shop,
         finalResult
       );
     }
@@ -1267,5 +1428,6 @@ console.log(
 
 module.exports = {
   recommendProducts,
-  getGLMCacheKey
+  getGLMCacheKey,
+  forgetShopAnswers
 };

@@ -6,7 +6,8 @@ const {
   DEFAULT_LIMIT,
   MAX_LIMIT,
   clampInt,
-  listGoalProducts
+  listGoalProducts,
+  listProductTypes
 } = require("../services/goal/goal-products.service");
 
 
@@ -15,6 +16,8 @@ const {
 // =========================================================
 //
 // GET /api/internal/goal/products?shop=...&page=...&limit=...&search=...
+//     optional: &sort=title_asc|title_desc|price_asc|price_desc
+//               &inStock=1  &productType=...
 //
 // Read-only. Used by the admin Goal UI's product picker to
 // browse/search the already-synced catalog. Does not touch
@@ -101,20 +104,41 @@ const listProducts = async (
       "";
 
 
-    const {
-      products,
-      page,
-      limit,
-      hasMore
-    } =
-      await listGoalProducts({
-        shop,
-        page:
-          pageResult.value,
-        limit:
-          limitResult.value,
-        search
-      });
+    // Optional sort / filters (absent = same list as before).
+    const sort =
+      String(req.query.sort || "");
+
+    const inStock =
+      req.query.inStock === "1" ||
+      req.query.inStock === "true";
+
+    const productType =
+      String(req.query.productType || "");
+
+
+    const [
+      {
+        products,
+        page,
+        limit,
+        hasMore
+      },
+      productTypes
+    ] =
+      await Promise.all([
+        listGoalProducts({
+          shop,
+          page:
+            pageResult.value,
+          limit:
+            limitResult.value,
+          search,
+          sort,
+          inStock,
+          productType
+        }),
+        listProductTypes(shop, { inStock })
+      ]);
 
 
     return res.status(200).json({
@@ -129,7 +153,9 @@ const listProducts = async (
 
         limit,
 
-        hasMore
+        hasMore,
+
+        productTypes
 
       }
 
