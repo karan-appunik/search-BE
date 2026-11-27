@@ -1,3 +1,6 @@
+const path =
+  require("path");
+
 const express =
   require("express");
 
@@ -146,6 +149,24 @@ app.use(
     limit:
       "1mb"
   })
+);
+
+
+// =========================================================
+// FAVICON (browser tab icon for api.askmerce.space)
+// =========================================================
+
+app.get(
+  "/favicon.ico",
+
+  (req, res) => {
+
+    return res.sendFile(
+      path.join(__dirname, "..", "public", "favicon.ico"),
+      { maxAge: "7d" }
+    );
+
+  }
 );
 
 
